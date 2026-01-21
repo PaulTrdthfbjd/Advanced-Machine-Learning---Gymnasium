@@ -1,3 +1,4 @@
+# wrappers.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,7 +42,27 @@ def _is_image_space(space: gym.Space) -> bool:
         return True  # (H,W,C)
     return False
 
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip=4):
+        super().__init__(env)
+        self._skip = skip
 
+    def step(self, action):
+        """Répète l'action et somme les rewards."""
+        total_reward = 0.0
+        done = False
+        terminated = False
+        truncated = False
+        
+        for i in range(self._skip):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward
+            done = terminated or truncated
+            if done:
+                break
+        
+        return obs, total_reward, terminated, truncated, info
+    
 def make_pixels_only_env(
     env_id: str,
     seed: int,
@@ -104,6 +125,8 @@ def make_pixels_only_env(
 
     if record_episode_stats:
         env = RecordEpisodeStatistics(env)
+    # Skip frames
+    env = SkipFrame(env, skip=4)
 
     # Grayscale uniquement si on est en (H,W,3) ou (H,W,1)
     obs_space = env.observation_space

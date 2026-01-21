@@ -1,11 +1,14 @@
+# Evaluate.py
 from __future__ import annotations
-
 import argparse
 import os
 import re
 import json
 import numpy as np
 import torch
+
+import gymnasium as gym
+import ale_py
 
 from rl2.dqn import CNNQNetwork
 from rl2.wrappers import make_pixels_only_env, PixelPipelineConfig, obs_to_numpy_u8
@@ -51,6 +54,7 @@ def _resolve_checkpoint_arg(ckpt_arg: str) -> str:
 
 
 def main() -> None:
+    gym.register_envs(ale_py)
     p = argparse.ArgumentParser()
     p.add_argument("--env-id", type=str, required=True)
     p.add_argument("--env-kwargs", type=str, default="{}", help="JSON dict passed to gym.make (e.g. CarRacing: {\"continuous\": false})")
@@ -64,7 +68,7 @@ def main() -> None:
     p.add_argument("--record-video", action="store_true")
     p.add_argument("--video-folder", type=str, default="videos")
     p.add_argument("--video-prefix", type=str, default="eval")
-    p.add_argument("--video-length", type=int, default=1000)
+    p.add_argument("--video-length", type=int, default=10000)
     p.add_argument("--video-once", action="store_true")
 
     args = p.parse_args()

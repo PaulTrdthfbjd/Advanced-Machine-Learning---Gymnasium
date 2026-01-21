@@ -1,3 +1,4 @@
+# train_dqn_pixels.py
 from __future__ import annotations
 
 import argparse
@@ -6,7 +7,11 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.optim as optim  # Added missing import
 from tqdm import trange
+
+import ale_py
+import gymnasium as gym
 
 from rl2.utils import set_global_seeds, make_run_dir, SafeSummaryWriter
 from rl2.replay_buffer import ReplayBuffer
@@ -53,6 +58,8 @@ def evaluate_pixels(env_id: str, qnet: CNNQNetwork, device: torch.device, episod
 
 
 def main() -> None:
+
+    gym.register_envs(ale_py)
     p = argparse.ArgumentParser()
 
     p.add_argument("--env-id", type=str, default="CartPole-v1")
@@ -91,6 +98,11 @@ def main() -> None:
 
     p.add_argument("--double-dqn", action="store_true", default=True)
     p.add_argument("--no-double-dqn", action="store_false", dest="double_dqn")
+
+    # --- NEW ARGS FOR RESUMING ---
+    p.add_argument("--checkpoint-path", type=str, default=None, help="Path to checkpoint .pt file to resume from")
+    p.add_argument("--start-step", type=int, default=0, help="Step to resume training from (e.g. 500000)")
+    # -----------------------------
 
     args = p.parse_args()
 
@@ -131,13 +143,31 @@ def main() -> None:
 
     qnet = CNNQNetwork(in_channels=obs_shape[0], n_actions=n_actions).to(device)
     target = CNNQNetwork(in_channels=obs_shape[0], n_actions=n_actions).to(device)
+    
+    # --- RESUME LOGIC ---
+    if args.checkpoint_path and os.path.exists(args.checkpoint_path):
+        print(f"🔄 Loading checkpoint: {args.checkpoint_path}")
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        
+        # Load state dict directly or from 'model' key depending on how it was saved
+        if 'model' in checkpoint:
+            qnet.load_state_dict(checkpoint['model'])
+        else:
+            qnet.load_state_dict(checkpoint)
+            
+        print(f"✅ Model loaded. Resuming at step {args.start_step}")
+    else:
+        print("🚀 Starting new training from scratch.")
+    # --------------------
+
     target.load_state_dict(qnet.state_dict())
     target.eval()
 
     optim = torch.optim.Adam(qnet.parameters(), lr=args.lr)
     rb = ReplayBuffer(args.buffer_size, obs_shape=obs_shape)
 
-    progress = trange(args.total_steps, desc="training", dynamic_ncols=True)
+    # Start from start_step
+    progress = trange(args.start_step, args.total_steps, desc="training", dynamic_ncols=True)
 
     for global_step in progress:
         eps = linear_schedule(args.eps_start, args.eps_end, args.eps_decay_steps, global_step)
@@ -155,7 +185,7 @@ def main() -> None:
         next_obs, reward, terminated, truncated, info = env.step(action)
 
         done_for_reset = bool(terminated or truncated)
-        terminated_flag = bool(terminated)  # IMPORTANT: truncated bootstrappe
+        terminated_flag = bool(terminated)  
 
         next_obs_u8 = obs_to_numpy_u8(next_obs)
 
@@ -176,6 +206,9 @@ def main() -> None:
             obs, info = env.reset()
 
         # Learn
+        # Note: Even if resuming, we need to fill the buffer a bit before learning again
+        # The condition (global_step >= args.learning_starts) handles this if start_step > learning_starts
+        # BUT the buffer is empty on restart! So we need to wait until len(rb) > batch_size.
         if global_step >= args.learning_starts and (global_step % args.train_freq == 0) and len(rb) >= args.batch_size:
             batch = rb.sample(args.batch_size, rng)
 
@@ -185,7 +218,24 @@ def main() -> None:
             b_rewards = torch.from_numpy(batch["rewards"]).to(device)
             b_terminated = torch.from_numpy(batch["terminated"]).to(device)
 
-            q_sa = qnet(b_obs).gather(1, b_actions.unsqueeze(1)).squeeze(1)
+            # Forward pass (Q-values for all actions)
+            q_all = qnet(b_obs)  # (B, n_actions)
+
+            # Q(s,a) for the taken actions
+            q_sa = q_all.gather(1, b_actions.unsqueeze(1)).squeeze(1)
+
+            # ---- Q-value stats (for plots / report) ----
+            # Average Q over all actions & batch
+            q_mean = q_all.mean().item()
+            # Average of max_a Q(s,a) over batch
+            q_max_mean = q_all.max(dim=1).values.mean().item()
+            # Average Q(s,a) of the actions actually taken (in replay)
+            q_sa_mean = q_sa.mean().item()
+
+            writer.add_scalar("train/q_mean", q_mean, global_step)
+            writer.add_scalar("train/q_max_mean", q_max_mean, global_step)
+            writer.add_scalar("train/q_sa_mean", q_sa_mean, global_step)
+            # -------------------------------------------
 
             with torch.no_grad():
                 if args.double_dqn:
@@ -195,6 +245,9 @@ def main() -> None:
                     next_q = target(b_next).max(dim=1).values
 
                 target_q = b_rewards + args.gamma * next_q * (~b_terminated)
+                td_error_mean = (target_q - q_sa).abs().mean().item()
+                writer.add_scalar("train/td_error_mean", td_error_mean, global_step)        
+
 
             loss = F.smooth_l1_loss(q_sa, target_q)
 
